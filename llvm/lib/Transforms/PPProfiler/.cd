@@ -1,0 +1,116 @@
+#include "llvm/ADT/Statistic.h"
+#include "llvm/IR/Function.h"
+#include "llvm/IR/PassManager.h"
+#include "llvm/Passes/PassBuilder.h"
+#include "llvm/Passes/PassPlugin.h"
+#include "llvm/Support/Debug.h"
+
+using namespace llvm;
+
+#define DEBUG_TYPE "ppprofiler"
+
+ALWAYS_ENABLED_STATISTIC(
+    NumOfFunc, "Number of instrumented functions.");
+
+namespace {
+class PPProfilerIRPass
+    : public llvm::PassInfoMixin<PPProfilerIRPass> {
+public:
+  llvm::PreservedAnalyses
+  run(llvm::Module &M, llvm::ModuleAnalysisManager &AM);
+private:
+// helper for instrumentation.
+  void instrument(llvm::Function &F,
+                  llvm::Function *EnterFn,
+                  llvm::Function *ExitFn);
+};
+}
+
+void PPProfilerIRPass::instrument(llvm::Function &F,
+                                  Function *EnterFn,
+                                  Function *ExitFn) {
+  // updating the statistic counter
+  ++NumOfFunc;
+  // to insert IR code, creating an instance of IRBuilder class. and setting it to entry block of the function.
+  IRBuilder<> Builder(&*F.getEntryBlock().begin());
+  // FnName holds the name of the function.
+  GlobalVariable *FnName =
+      Builder.CreateGlobalString(F.getName());
+  // inserting __ppp_enter() to the function at the begining
+  Builder.CreateCall(EnterFn->getFunctionType(), EnterFn,
+                     {FnName});
+  // insert __ppp_exit() before every return.
+  for (BasicBlock &BB : F) {
+    for (Instruction &Inst : BB) {
+      if (Inst.getOpcode() == Instruction::Ret) {
+        Builder.SetInsertPoint(&Inst);
+        Builder.CreateCall(ExitFn->getFunctionType(),
+                           ExitFn, {FnName});
+      }
+    }
+  }
+}
+
+PreservedAnalyses
+PPProfilerIRPass::run(Module &M,
+                      ModuleAnalysisManager &AM) {
+  // if you find these definitions in runtime module just do nothing.
+  if (M.getFunction("__ppp_enter") ||
+      M.getFunction("__ppp_exit")) {
+    return PreservedAnalyses::all();
+  }
+
+  // creating a void type (void*)
+  Type *VoidTy = Type::getVoidTy(M.getContext());
+  // (pointer*)
+  PointerType *PtrTy =
+      PointerType::getUnqual(M.getContext());
+  // (void __ppp_function(void*);)
+  FunctionType *EnterExitFty =
+      FunctionType::get(VoidTy, {PtrTy}, false);
+  // what is visible in llvm IR (declare void @__ppp_enter(void*)) 
+  // GlobalValue::ExternalLinkage : like extern in C
+  Function *EnterFn = Function::Create(
+      EnterExitFty, GlobalValue::ExternalLinkage,
+      "__ppp_enter", M);
+  // (declare void @__ppp_exit(void*))
+  Function *ExitFn = Function::Create(
+      EnterExitFty, GlobalValue::ExternalLinkage,
+      "__ppp_exit", M);
+  
+  //if function is not just a declaration and it has name, then run instrumentation.
+  for (auto &F : M.functions()) {
+    if (!F.isDeclaration() && F.hasName())
+      instrument(F, EnterFn, ExitFn);
+  }
+
+  // we are not preserving any analysis just to be safe.
+  return PreservedAnalyses::none();
+}
+
+// if you find the ppprofiler string in the pipeline string, add our pass to the pass manager.
+void RegisterCB(PassBuilder &PB) {
+  PB.registerPipelineParsingCallback(
+      [](StringRef Name, ModulePassManager &MPM,
+         ArrayRef<PassBuilder::PipelineElement>) {
+        if (Name == "ppprofiler") {
+          MPM.addPass(PPProfilerIRPass());
+          return true;
+        }
+        return false;
+      });
+}
+
+
+// for static linking of our pass.
+llvm::PassPluginLibraryInfo getPPProfilerPluginInfo() {
+  return {LLVM_PLUGIN_API_VERSION, "PPProfiler", "v0.1",
+          RegisterCB};
+}
+
+// for dynamic linking of our pass.
+#ifndef LLVM_PPPROFILER_LINK_INTO_TOOLS
+extern "C" LLVM_ATTRIBUTE_WEAK ::llvm::PassPluginLibraryInfo
+llvmGetPassPluginInfo() {
+  return getPPProfilerPluginInfo();
+}
